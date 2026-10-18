@@ -8,7 +8,7 @@ Wyjście (katalog OUT):
   index.json        – wersja danych, rozmiar siatki, liczba kafelków
   t/<i>_<j>.json    – kafelek ok. 5,5 × 5,5 km: {"w": [drogi], "c": [fotoradary]}
 
-Format drogi:     [id, maxspeed, nazwa, highway, typ_limitu, [lat0, lon0, dlat1, dlon1, ...]]
+Format drogi:     [id, maxspeed, nazwa, highway, typ_limitu, [lat0, lon0, dlat1, dlon1, ...], (maxspeed:hgv, maxspeed:trailer, motorroad 0/1)]
                   współrzędne × 1e5, od drugiego punktu zapisywane jako różnice (krócej)
 Format fotoradaru:[id, lat×1e5, lon×1e5, maxspeed, kierunek]
 sections.json     – odcinkowe pomiary prędkości (relacje type=enforcement + enforcement=average_speed):
@@ -103,7 +103,12 @@ class Builder(osmium.SimpleHandler):
             else:
                 g += [a - plat, b - plon]
             plat, plon = a, b
+        hgv = t.get("maxspeed:hgv") or ""
+        trailer = t.get("maxspeed:trailer") or ""
+        motorroad = 1 if t.get("motorroad") == "yes" else 0
         rec = [w.id, maxspeed, name, hw, kind, g]
+        if hgv or trailer or motorroad:          # pola dodatkowe tylko gdy są (mniejsze kafelki)
+            rec += [hgv, trailer, motorroad]
         for k in tile_range([p[0] for p in pts], [p[1] for p in pts]):
             self.tiles[k]["w"].append(rec)
         self.ways += 1
