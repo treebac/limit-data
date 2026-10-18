@@ -1,0 +1,58 @@
+name: Buduj dane limitów
+
+on:
+  schedule:
+    - cron: '17 3 * * *'      # codziennie ok. 5:17 czasu polskiego (Geofabrik aktualizuje wieczorem)
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths: [ 'build_tiles.py', '.github/workflows/build.yml' ]
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    env:
+      REGION_URL: https://download.geofabrik.de/europe/poland-latest.osm.pbf
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Narzędzia
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq osmium-tool
+          pip install osmium==4.0.2
+
+      - name: Pobierz mapę Polski (Geofabrik)
+        run: curl -sSfL --retry 3 -o region.osm.pbf "$REGION_URL" && ls -lh region.osm.pbf
+
+      - name: Wytnij drogi i fotoradary
+        run: |
+          osmium tags-filter region.osm.pbf \
+            w/highway=motorway,trunk,primary,secondary,tertiary,unclassified,residential,living_street,motorway_link,trunk_link,primary_link,secondary_link \
+            n/highway=speed_camera \
+            -o roads.osm.pbf --overwrite
+          rm region.osm.pbf
+          ls -lh roads.osm.pbf
+
+      - name: Zbuduj kafelki
+        run: python build_tiles.py roads.osm.pbf out && du -sh out
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: out
+      - id: deploy
+        uses: actions/deploy-pages@v4
