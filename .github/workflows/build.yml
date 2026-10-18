@@ -43,6 +43,7 @@ jobs:
           osmium tags-filter region.osm.pbf \
             w/highway=motorway,trunk,primary,secondary,tertiary,unclassified,residential,living_street,motorway_link,trunk_link,primary_link,secondary_link \
             n/highway=speed_camera \
+            r/enforcement=average_speed \
             -o roads.osm.pbf --overwrite
           rm region.osm.pbf
           ls -lh roads.osm.pbf
