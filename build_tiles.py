@@ -8,7 +8,9 @@ Wyjście (katalog OUT):
   index.json        – wersja danych, rozmiar siatki, liczba kafelków
   t/<i>_<j>.json    – kafelek ok. 5,5 × 5,5 km: {"w": [drogi], "c": [fotoradary]}
 
-Format drogi:     [id, maxspeed, nazwa, highway, typ_limitu, [lat0, lon0, dlat1, dlon1, ...], (maxspeed:hgv, maxspeed:trailer, motorroad 0/1)]
+Format drogi:     [id, maxspeed, nazwa, highway, typ_limitu, [lat0, lon0, dlat1, dlon1, ...], (maxspeed:hgv, maxspeed:trailer, motorroad 0/1, zabudowa)]
+                  zabudowa – tylko dla dróg bez limitu w danych: dla każdego odcinka między węzłami "1" (w mieście/wsi)
+                  lub "0", albo jeden znak, gdy cała droga jest po jednej stronie; aplikacja szacuje wtedy 50 albo 90 km/h
                   współrzędne × 1e5, od drugiego punktu zapisywane jako różnice (krócej)
 Format fotoradaru:[id, lat×1e5, lon×1e5, maxspeed, kierunek]
 sections.json     – odcinkowe pomiary prędkości (relacje type=enforcement + enforcement=average_speed):
@@ -17,8 +19,14 @@ sections.json     – odcinkowe pomiary prędkości (relacje type=enforcement + 
 Dane © współtwórcy OpenStreetMap, licencja ODbL.
 """
 import json, math, os, sys, time
+from array import array
 from collections import defaultdict
 import osmium
+try:
+    import shapely
+    from shapely import STRtree
+except ImportError:          # bez shapely kafelki budują się jak dawniej, bez szacowania zabudowy
+    shapely = None
 
 HIGHWAYS = {"motorway", "trunk", "primary", "secondary", "tertiary", "unclassified", "residential",
             "living_street", "motorway_link", "trunk_link", "primary_link", "secondary_link"}
@@ -62,12 +70,77 @@ def dist_m(a, b):
     return 6371000 * math.hypot(x, y)
 
 
+BUILT_LANDUSE = {"residential", "commercial", "retail"}
+BUILT_PLACE = {"city", "town", "village", "suburb", "quarter", "neighbourhood", "hamlet"}
+NEAR_DEG = 0.0004            # ok. 30–45 m: znak „obszar zabudowany” stoi zwykle tuż przed pierwszymi domami
+NO_GUESS = {"motorway", "motorway_link", "residential", "living_street"}   # te mają limit domyślny z rodzaju drogi
+
+
+def load_built_up(path):
+    """Obszary zabudowane: osiedla, centra handlowe i granice miejscowości z OSM (wielokąty)."""
+    if not shapely or not path or not os.path.exists(path):
+        return None
+    wkb = osmium.geom.WKBFactory()
+    geoms = []
+    fp = osmium.FileProcessor(path).with_areas().with_filter(osmium.filter.EntityFilter(osmium.osm.AREA))
+    for a in fp:
+        t = a.tags
+        if t.get("landuse") not in BUILT_LANDUSE and t.get("place") not in BUILT_PLACE:
+            continue
+        try:
+            g = shapely.from_wkb(wkb.create_multipolygon(a))
+        except Exception:
+            continue
+        if g is not None and not g.is_empty:
+            geoms.append(g)
+    print(f"obszary zabudowane: {len(geoms)}", flush=True)
+    return STRtree(geoms) if geoms else None
+
+
+def mark_built_up(tree, todo):
+    """todo: lista (rekord_drogi, szer[], dł[]) → dopisuje maskę zabudowy (pole 9): jeden znak na odcinek między węzłami.
+    Odcinek jest „w zabudowie”, gdy co najmniej połowa punktów próbkowanych co ~50 m leży w mieście/wsi."""
+    if tree is None or not todo:
+        return 0
+    CH = 300000
+    k = 0
+    while k < len(todo):
+        lats, lons, segs = [], [], []        # segs: (indeks drogi w paczce, liczba próbek) w kolejności odcinków
+        batch = []
+        while k < len(todo) and len(lats) < CH:
+            rec, la, lo = todo[k]; batch.append(rec)
+            for i in range(1, len(la)):
+                d = dist_m((la[i - 1], lo[i - 1]), (la[i], lo[i]))
+                n = max(1, min(40, int(d // 50)))
+                for j in range(n):
+                    f = (j + 0.5) / n
+                    lats.append(la[i - 1] + (la[i] - la[i - 1]) * f); lons.append(lo[i - 1] + (lo[i] - lo[i - 1]) * f)
+                segs.append((len(batch) - 1, n))
+            k += 1
+        hit = set(tree.query(shapely.points(lons, lats), predicate="dwithin", distance=NEAR_DEG)[0].tolist())
+        masks = [[] for _ in batch]
+        p = 0
+        for b, n in segs:
+            ins = sum(1 for q in range(p, p + n) if q in hit)
+            masks[b].append("1" if ins * 2 >= n else "0")
+            p += n
+        for rec, m in zip(batch, masks):
+            m = "".join(m) or "0"
+            if m.count(m[0]) == len(m):
+                m = m[0]
+            if len(rec) == 6:
+                rec += ["", "", 0]
+            rec.append(m)
+    return len(todo)
+
+
 class Builder(osmium.SimpleHandler):
     def __init__(self, need=()):
         super().__init__()
         self.tiles = defaultdict(lambda: {"w": [], "c": []})
         self.ways = self.cams = self.skipped = 0
         self.need, self.coords = set(need), {}
+        self.todo = []   # drogi bez limitu do oznaczenia zabudowy
 
     def node(self, n):
         if n.id in self.need:
@@ -109,20 +182,27 @@ class Builder(osmium.SimpleHandler):
         rec = [w.id, maxspeed, name, hw, kind, g]
         if hgv or trailer or motorroad:          # pola dodatkowe tylko gdy są (mniejsze kafelki)
             rec += [hgv, trailer, motorroad]
+        if not maxspeed and not kind and hw not in NO_GUESS and not motorroad:
+            self.todo.append((rec, array("d", (p[0] for p in pts)), array("d", (p[1] for p in pts))))
         for k in tile_range([p[0] for p in pts], [p[1] for p in pts]):
             self.tiles[k]["w"].append(rec)
         self.ways += 1
 
 
 def main():
-    if len(sys.argv) != 3:
-        sys.exit("użycie: build_tiles.py wejście.osm.pbf katalog_wyjściowy")
+    if len(sys.argv) not in (3, 4):
+        sys.exit("użycie: build_tiles.py drogi.osm.pbf katalog_wyjściowy [zabudowa.osm.pbf]")
     src, out = sys.argv[1], sys.argv[2]
+    built = sys.argv[3] if len(sys.argv) == 4 else None
     t0 = time.time()
     scan = SectionScan()
     scan.apply_file(src)
     b = Builder(scan.need)
     b.apply_file(src, locations=True, idx="flex_mem")
+    tree = load_built_up(built)
+    marked = mark_built_up(tree, b.todo)
+    print(f"drogi z oszacowaną zabudową: {marked}", flush=True)
+    b.todo = None
     os.makedirs(os.path.join(out, "t"), exist_ok=True)
     size = 0
     for k, tile in b.tiles.items():
@@ -142,7 +222,7 @@ def main():
     index = {
         "v": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "f": 2, "tlat": TLAT, "tlon": TLON,
-        "tiles": len(b.tiles), "ways": b.ways, "cams": b.cams, "sections": len(secs),
+        "tiles": len(b.tiles), "ways": b.ways, "guessed": marked, "cams": b.cams, "sections": len(secs),
         "source": os.environ.get("REGION_URL", src),
         "license": "© OpenStreetMap contributors, ODbL",
     }

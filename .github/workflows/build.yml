@@ -33,13 +33,18 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq osmium-tool
-          pip install osmium==4.0.2
+          pip install osmium==4.0.2 shapely==2.0.6
 
       - name: Pobierz mapę Polski (Geofabrik)
         run: curl -sSfL --retry 3 -o region.osm.pbf "$REGION_URL" && ls -lh region.osm.pbf
 
       - name: Wytnij drogi i fotoradary
         run: |
+          # obszary zabudowane (osiedla, handel, granice miejscowości) do szacowania 50/90 km/h tam, gdzie brak znaku w danych
+          osmium tags-filter region.osm.pbf \
+            wr/landuse=residential,commercial,retail \
+            wr/place=city,town,village,suburb,quarter,neighbourhood,hamlet \
+            -o built.osm.pbf --overwrite
           osmium tags-filter region.osm.pbf \
             w/highway=motorway,trunk,primary,secondary,tertiary,unclassified,residential,living_street,motorway_link,trunk_link,primary_link,secondary_link \
             n/highway=speed_camera \
@@ -49,7 +54,7 @@ jobs:
           ls -lh roads.osm.pbf
 
       - name: Zbuduj kafelki
-        run: python build_tiles.py roads.osm.pbf out && du -sh out
+        run: python build_tiles.py roads.osm.pbf out built.osm.pbf && du -sh out
 
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
