@@ -134,6 +134,39 @@ def mark_built_up(tree, todo):
     return len(todo)
 
 
+GRID = 50   # siatka zabudowy w kafelku: 50 × 50 pól, każde ok. 110 × 110 m
+
+
+def built_grids(tree, keys):
+    """Dla każdego kafelka: bitmapa pól leżących w miejscowości (base64). Pozwala szacować 50/90 km/h
+    także tam, gdzie w danych nie ma żadnej drogi (np. droga wewnętrzna, nowa ulica)."""
+    out = {}
+    if tree is None:
+        return out
+    import base64
+    keys = sorted(keys)
+    for s in range(0, len(keys), 120):
+        part = keys[s:s + 120]
+        lats, lons = [], []
+        for k in part:
+            i, j = map(int, k.split("_"))
+            for r in range(GRID):
+                for c in range(GRID):
+                    lats.append(i * TLAT + (r + 0.5) * TLAT / GRID)
+                    lons.append(j * TLON + (c + 0.5) * TLON / GRID)
+        hit = tree.query(shapely.points(lons, lats), predicate="dwithin", distance=NEAR_DEG + 0.0003)[0]
+        per = GRID * GRID
+        bits = {}
+        for h in set(hit.tolist()):
+            bits.setdefault(h // per, []).append(h % per)
+        for t, idx in bits.items():
+            buf = bytearray((per + 7) // 8)
+            for x in idx:
+                buf[x >> 3] |= 1 << (x & 7)
+            out[part[t]] = base64.b64encode(bytes(buf)).decode()
+    return out
+
+
 class Builder(osmium.SimpleHandler):
     def __init__(self, need=()):
         super().__init__()
@@ -202,6 +235,10 @@ def main():
     tree = load_built_up(built)
     marked = mark_built_up(tree, b.todo)
     print(f"drogi z oszacowaną zabudową: {marked}", flush=True)
+    grids = built_grids(tree, list(b.tiles.keys()))
+    for k, g in grids.items():
+        b.tiles[k]["b"] = g
+    print(f"kafelki z siatką zabudowy: {len(grids)}", flush=True)
     b.todo = None
     os.makedirs(os.path.join(out, "t"), exist_ok=True)
     size = 0
@@ -221,7 +258,7 @@ def main():
         json.dump({"s": secs}, f, ensure_ascii=False, separators=(",", ":"))
     index = {
         "v": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "f": 2, "tlat": TLAT, "tlon": TLON,
+        "f": 3, "grid": GRID, "tlat": TLAT, "tlon": TLON,
         "tiles": len(b.tiles), "ways": b.ways, "guessed": marked, "cams": b.cams, "sections": len(secs),
         "source": os.environ.get("REGION_URL", src),
         "license": "© OpenStreetMap contributors, ODbL",
